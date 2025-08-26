@@ -55,48 +55,53 @@ const fs_1 = __nccwpck_require__(9896);
 const os_1 = __nccwpck_require__(857);
 const path = __importStar(__nccwpck_require__(6928));
 const nix = __importStar(__nccwpck_require__(451));
-function installPackages(nixProfileDir, inputsFromLockedUrl) {
+function augmentPackages(packages) {
     return __awaiter(this, void 0, void 0, function* () {
-        // Install given `packages`, if any
-        const packages = core.getInput("packages");
-        if (packages) {
-            const augumentedPackages = yield Promise.all(packages
-                .split(",")
-                .map((str) => str.trim())
-                .map(nix.maybeAddNixpkgs));
-            const inputsFromArgs = inputsFromLockedUrl
-                ? ["--inputs-from", inputsFromLockedUrl]
-                : [];
-            yield nix.runNix([
-                "profile",
-                "install",
-                "--profile",
-                nixProfileDir,
-                ...inputsFromArgs,
-                ...augumentedPackages,
-            ], { silent: false });
-        }
+        return Promise.all(packages
+            .split(",")
+            .map((str) => str.trim())
+            .map(nix.maybeAddNixpkgs));
     });
 }
-function installExpr(nixProfileDir, inputsFromLockedUrl) {
+function installPackages(packages, nixProfileDir, inputsFromLockedUrl) {
     return __awaiter(this, void 0, void 0, function* () {
-        const expr = core.getInput("expr");
-        if (expr) {
-            const system = yield nix.determineSystem();
-            const repoFlake = yield nix.getRepoLockedUrl(process.cwd());
-            yield nix.runNix([
-                "profile",
-                "install",
-                "--profile",
-                nixProfileDir,
-                "--expr",
-                `let
+        const inputsFromArgs = inputsFromLockedUrl
+            ? ["--inputs-from", inputsFromLockedUrl]
+            : [];
+        yield nix.runNix([
+            "profile",
+            "install",
+            "--profile",
+            nixProfileDir,
+            ...inputsFromArgs,
+            ...(yield augmentPackages(packages)),
+        ], { silent: false });
+    });
+}
+function installExpr(expr, nixProfileDir, inputsFromLockedUrl, allowUnfree) {
+    return __awaiter(this, void 0, void 0, function* () {
+        const system = yield nix.determineSystem();
+        const repoFlake = yield nix.getRepoLockedUrl(process.cwd());
+        yield nix.runNix([
+            "profile",
+            "install",
+            "--profile",
+            nixProfileDir,
+            "--expr",
+            `let
          repoFlake = builtins.getFlake("${repoFlake}");
          inputsFromFlake = builtins.getFlake("${inputsFromLockedUrl}");
          nixpkgs = ${yield nix.getNixpkgs(inputsFromLockedUrl)};
-         pkgs = (import nixpkgs { system = "${system}"; });
+         pkgs = (import nixpkgs { system = "${system}"; config.allowUnfree = ${allowUnfree}; });
        in ${expr}`,
-            ], { silent: false });
+        ], { silent: false });
+    });
+}
+function installDummyPackages(binaryNames, nixProfileDir, inputsFromLockedUrl) {
+    return __awaiter(this, void 0, void 0, function* () {
+        const bins = binaryNames.split(",").map((b) => b.trim());
+        for (const bin of bins) {
+            yield installExpr(`pkgs.writeShellScriptBin "${bin}" "echo noop"`, nixProfileDir, inputsFromLockedUrl, false);
         }
     });
 }
@@ -118,15 +123,56 @@ function getInputsFrom() {
 }
 function main() {
     return __awaiter(this, void 0, void 0, function* () {
+        const packages = core.getInput("packages");
+        const expr = core.getInput("expr");
+        const dummyBins = core.getInput("dummy-bins");
         // Fail if no input is given
-        if (!core.getInput("packages") && !core.getInput("expr")) {
-            throw Error("Neither the `packages` nor the `expr` input is given");
+        if (!packages && !expr && !dummyBins) {
+            throw Error("Neither the `packages`, the `expr` nor the `dummy-bins` input is given");
+        }
+        // Verify `allow-unfree` input value
+        let allowUnfree = false;
+        switch (core.getInput("allow-unfree")) {
+            case "true":
+                allowUnfree = true;
+                break;
+            case "false":
+                allowUnfree = false;
+            case "":
+                allowUnfree = false;
+                break;
+            default:
+                throw Error(`allow-unfree: Expected an input of either "true" or "false"`);
         }
         const inputsFromLockedUrl = yield getInputsFrom();
         const stateDir = yield createOrGetStateDir();
         const nixProfileDir = path.join(stateDir, ".nix-profile");
-        yield installPackages(nixProfileDir, inputsFromLockedUrl);
-        yield installExpr(nixProfileDir, inputsFromLockedUrl);
+        if (packages) {
+            if (allowUnfree) {
+                const augmentedPackages = yield augmentPackages(packages);
+                // nixpkgs# packages
+                for (const pkg of augmentedPackages.filter((pkg) => pkg.startsWith("nixpkgs#"))) {
+                    const pkgName = pkg.replace("nixpkgs#", "");
+                    yield installExpr(`pkgs.${pkgName}`, nixProfileDir, inputsFromLockedUrl, allowUnfree);
+                }
+                // All other packages
+                const nonNixpkgsPackages = augmentedPackages
+                    .filter((pkg) => !pkg.startsWith("nixpkgs#"))
+                    .join(",");
+                if (nonNixpkgsPackages.length > 0) {
+                    yield installPackages(nonNixpkgsPackages, nixProfileDir, inputsFromLockedUrl);
+                }
+            }
+            else {
+                yield installPackages(packages, nixProfileDir, inputsFromLockedUrl);
+            }
+        }
+        if (expr) {
+            yield installExpr(expr, nixProfileDir, inputsFromLockedUrl, allowUnfree);
+        }
+        if (dummyBins) {
+            yield installDummyPackages(dummyBins, nixProfileDir, inputsFromLockedUrl);
+        }
         core.addPath(path.join(nixProfileDir, "bin"));
         core.setOutput("nix_profile_path", nixProfileDir);
         // Export the directory to remove it in the post action of the workflow
